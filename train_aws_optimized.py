@@ -27,11 +27,22 @@ import time
 warnings.filterwarnings('ignore')
 
 class AWSOptimizedFootballPredictor:
-    def __init__(self):
+    def __init__(self, memory_limit_mb=28000):
         self.model = None
         self.scaler = StandardScaler()
         self.feature_names = []
         self.start_time = time.time()
+        self.memory_limit_mb = memory_limit_mb
+        
+    def check_memory_limit(self, stage=""):
+        """Check if memory limit is exceeded and trigger cleanup if needed."""
+        current_memory = self.log_memory_usage(stage)
+        if current_memory > self.memory_limit_mb:
+            print(f"⚠️  Memory limit exceeded ({current_memory:.1f}MB > {self.memory_limit_mb}MB)")
+            print("   Triggering garbage collection...")
+            gc.collect()
+            return True
+        return False
         
     def log_memory_usage(self, stage=""):
         """Monitor memory usage for optimization."""
@@ -41,10 +52,10 @@ class AWSOptimizedFootballPredictor:
         print(f"[{elapsed:.1f}s] {stage}: {memory_mb:.1f} MB RAM")
         return memory_mb
         
-    def load_and_clean_data(self, file_pattern='./e0/*.csv'):
-        """Load and clean football data with aggressive memory management."""
+    def load_and_clean_data(self, file_pattern='./e0/*.csv', max_memory_mb=8000):
+        """Load and clean football data with memory-constrained batch processing."""
         print("="*60)
-        print("🚀 AWS-OPTIMIZED FOOTBALL PREDICTOR")
+        print("🚀 AWS-OPTIMIZED FOOTBALL PREDICTOR (Memory-Constrained)")
         print("="*60)
         
         self.log_memory_usage("Starting data load")
@@ -52,35 +63,70 @@ class AWSOptimizedFootballPredictor:
         file_paths = glob.glob(file_pattern)
         print(f"Found {len(file_paths)} data files")
         
-        df_list = []
-        files_loaded = 0
+        # Process files in batches to avoid memory overload
+        batch_size = max(1, min(50, len(file_paths) // 4))  # Adaptive batch size
+        all_data_chunks = []
         
-        for file in file_paths:
-            try:
-                # Try multiple encodings for compatibility
-                encodings_to_try = ['utf-8', 'latin-1', 'iso-8859-1', 'cp1252']
-                df = None
-                for encoding in encodings_to_try:
-                    try:
-                        df = pd.read_csv(file, encoding=encoding)
-                        break
-                    except UnicodeDecodeError:
-                        continue
-                
-                if df is not None:
-                    df_list.append(df)
-                    files_loaded += 1
-                    if files_loaded % 20 == 0:
-                        print(f"  Loaded {files_loaded} files...")
+        for i in range(0, len(file_paths), batch_size):
+            batch_files = file_paths[i:i+batch_size]
+            print(f"Processing batch {i//batch_size + 1}: files {i+1}-{min(i+batch_size, len(file_paths))}")
+            
+            batch_list = []
+            for file in batch_files:
+                try:
+                    # Try multiple encodings for compatibility
+                    encodings_to_try = ['utf-8', 'latin-1', 'iso-8859-1', 'cp1252']
+                    df = None
+                    for encoding in encodings_to_try:
+                        try:
+                            df = pd.read_csv(file, encoding=encoding)
+                            break
+                        except UnicodeDecodeError:
+                            continue
+                    
+                    if df is not None:
+                        batch_list.append(df)
                         
-            except Exception as e:
-                print(f"  Skipping {file}: {e}")
+                except Exception as e:
+                    print(f"  Skipping {file}: {e}")
+            
+            if batch_list:
+                # Combine batch and immediately clean to save memory
+                batch_data = pd.concat(batch_list, ignore_index=True)
+                
+                # Essential columns for professional model
+                columns = ['Date', 'HomeTeam', 'AwayTeam', 'FTHG', 'FTAG', 'FTR',
+                          'HTHG', 'HTAG', 'HTR',  # Half-time stats
+                          'HS', 'AS', 'HST', 'AST',  # Shots
+                          'HF', 'AF', 'HC', 'AC',    # Fouls and Corners
+                          'HY', 'AY', 'HR', 'AR']    # Cards
+                
+                # Add betting odds if available
+                betting_cols = ['B365H', 'B365D', 'B365A']
+                available_betting = [col for col in betting_cols if col in batch_data.columns]
+                if available_betting:
+                    columns.extend(available_betting)
+                
+                # Filter to available columns immediately
+                available_columns = [col for col in columns if col in batch_data.columns]
+                batch_data = batch_data[available_columns].copy()
+                
+                all_data_chunks.append(batch_data)
+                
+                # Clean up batch memory
+                del batch_list, batch_data
+                gc.collect()
+                
+                # Check memory usage
+                current_memory = self.log_memory_usage(f"Batch {i//batch_size + 1} processed")
+                if current_memory > max_memory_mb:
+                    print(f"⚠️  Memory limit approached ({current_memory:.1f}MB), processing current data...")
+                    break
         
-        print(f"✅ Successfully loaded {len(df_list)} files")
-        self.log_memory_usage("Files loaded")
+        print(f"✅ Successfully processed {len(all_data_chunks)} batches")
         
-        # Combine data efficiently
-        all_data = pd.concat(df_list, ignore_index=True)
+        # Combine all batches efficiently
+        all_data = pd.concat(all_data_chunks, ignore_index=True)
         
         # Essential columns for professional model
         columns = ['Date', 'HomeTeam', 'AwayTeam', 'FTHG', 'FTAG', 'FTR',
@@ -131,9 +177,10 @@ class AWSOptimizedFootballPredictor:
         df_form = df.copy()
         
         # Use reasonable sample size for feature creation - balance accuracy vs memory
-        if len(df_form) > 8000:
-            df_form = df_form.tail(8000).copy()
+        if len(df_form) > 6000:
+            df_form = df_form.tail(6000).copy()
             print(f"📊 Using most recent {len(df_form)} matches for feature engineering")
+            gc.collect()  # Clean memory after sampling
         
         self.log_memory_usage("Starting feature creation")
         
@@ -147,10 +194,15 @@ class AWSOptimizedFootballPredictor:
         # OPTIMIZED ROLLING FEATURES
         # ================================
         def create_rolling_features(df, team_col, prefix, windows=[3, 5]):
-            """Memory-optimized rolling features."""
+            """Memory-optimized rolling features with chunking."""
             print(f"  🔄 Rolling features for {prefix} teams...")
             
             for window in windows:
+                # Check memory before each window calculation
+                if self.check_memory_limit(f"Rolling {prefix} window {window}"):
+                    print(f"    Skipping window {window} due to memory constraints")
+                    continue
+                    
                 win_col = 'HomeWin' if prefix == 'H' else 'AwayWin'
                 
                 # Create rolling stats with memory optimization
@@ -158,9 +210,27 @@ class AWSOptimizedFootballPredictor:
                 available_stats = [col for col in stats_cols if col in df.columns]
                 
                 if len(available_stats) > 0:
-                    rolling_stats = df.groupby(team_col).rolling(
-                        window=window, on='Date', min_periods=1
-                    )[available_stats].mean().reset_index()
+                    # Process teams in chunks to manage memory
+                    unique_teams = df[team_col].unique()
+                    chunk_size = max(1, len(unique_teams) // 4)
+                    
+                    rolling_results = []
+                    for i in range(0, len(unique_teams), chunk_size):
+                        team_chunk = unique_teams[i:i+chunk_size]
+                        df_chunk = df[df[team_col].isin(team_chunk)].copy()
+                        
+                        rolling_chunk = df_chunk.groupby(team_col).rolling(
+                            window=window, on='Date', min_periods=1
+                        )[available_stats].mean().reset_index()
+                        
+                        rolling_results.append(rolling_chunk)
+                        del df_chunk, rolling_chunk
+                        gc.collect()
+                    
+                    # Combine chunks
+                    rolling_stats = pd.concat(rolling_results, ignore_index=True)
+                    del rolling_results
+                    gc.collect()
                     
                     # Rename columns
                     rename_map = {}
@@ -178,11 +248,9 @@ class AWSOptimizedFootballPredictor:
                     
                     rolling_stats.rename(columns=rename_map, inplace=True)
                     df = pd.merge(df, rolling_stats, on=[team_col, 'Date'], how='left')
-                
-                # Memory cleanup
-                if 'rolling_stats' in locals():
+                    
                     del rolling_stats
-                gc.collect()
+                    gc.collect()
             
             return df
         
@@ -235,19 +303,41 @@ class AWSOptimizedFootballPredictor:
         # ================================
         print("  ⚽ Adding team strength indicators...")
         
-        # Team strength based on recent performance (replaces complex H2H)
-        team_strength = df_form.groupby('HomeTeam').agg({
-            'FTHG': 'mean',
-            'FTAG': 'mean',
-            'HomeWin': 'mean'
-        }).rename(columns={
-            'FTHG': 'TeamStrength_Goals',
-            'FTAG': 'TeamStrength_Conceded', 
-            'HomeWin': 'TeamStrength_Points'
-        })
+        # Team strength based on recent performance (replaces complex H2H) - chunked processing
+        print("  Processing team strength in chunks...")
+        unique_teams = list(set(df_form['HomeTeam'].unique()) | set(df_form['AwayTeam'].unique()))
+        chunk_size = max(1, len(unique_teams) // 3)
         
-        df_form = df_form.merge(team_strength, left_on='HomeTeam', right_index=True, how='left', suffixes=('', '_H'))
-        df_form = df_form.merge(team_strength, left_on='AwayTeam', right_index=True, how='left', suffixes=('', '_A'))
+        team_strength_chunks = []
+        for i in range(0, len(unique_teams), chunk_size):
+            team_chunk = unique_teams[i:i+chunk_size]
+            chunk_data = df_form[df_form['HomeTeam'].isin(team_chunk)]
+            
+            if not chunk_data.empty:
+                chunk_strength = chunk_data.groupby('HomeTeam').agg({
+                    'FTHG': 'mean',
+                    'FTAG': 'mean', 
+                    'HomeWin': 'mean'
+                }).rename(columns={
+                    'FTHG': 'TeamStrength_Goals',
+                    'FTAG': 'TeamStrength_Conceded',
+                    'HomeWin': 'TeamStrength_Points'
+                })
+                team_strength_chunks.append(chunk_strength)
+            
+            del chunk_data
+            gc.collect()
+        
+        # Combine team strength chunks
+        team_strength = pd.concat(team_strength_chunks, ignore_index=False) if team_strength_chunks else pd.DataFrame()
+        del team_strength_chunks
+        gc.collect()
+        
+        if not team_strength.empty:
+            df_form = df_form.merge(team_strength, left_on='HomeTeam', right_index=True, how='left', suffixes=('', '_H'))
+            df_form = df_form.merge(team_strength, left_on='AwayTeam', right_index=True, how='left', suffixes=('', '_A'))
+            del team_strength
+            gc.collect()
         
         # Clean up column names
         strength_cols = [col for col in df_form.columns if 'TeamStrength' in col]
@@ -299,14 +389,21 @@ class AWSOptimizedFootballPredictor:
         self.feature_names = existing_features
         return existing_features
     
-    def train_optimized_model(self, df_form, optimize_hyperparameters=True):
-        """Train model with cloud-optimized settings."""
-        print("\n🚀 Training optimized model...")
+    def train_optimized_model(self, df_form, optimize_hyperparameters=True, max_samples=4000):
+        """Train model with memory-constrained settings."""
+        print("\n🚀 Training memory-optimized model...")
         
         features = self.select_best_features(df_form)
         
-        # Prepare data with robust handling
+        # Prepare data with robust handling and sampling
         model_data = df_form.dropna(subset=features + ['Result'])
+        
+        # Limit training data size for memory efficiency
+        if len(model_data) > max_samples:
+            print(f"📊 Sampling {max_samples} most recent matches for memory efficiency")
+            model_data = model_data.tail(max_samples).copy()
+            gc.collect()
+        
         X = model_data[features].fillna(0)  # Handle any remaining NaNs
         y = model_data['Result']
         
@@ -317,7 +414,16 @@ class AWSOptimizedFootballPredictor:
             print("❌ ERROR: Insufficient training data!")
             return None, None, None
         
+        # Clean up intermediate data
+        del model_data
+        gc.collect()
+        
         self.log_memory_usage("Data preparation complete")
+        
+        # Check memory before proceeding
+        if self.check_memory_limit("Before model training"):
+            print("⚠️  Reducing training complexity due to memory constraints...")
+            optimize_hyperparameters = False  # Skip optimization if memory is tight
         
         # Balanced class weights
         class_weights = compute_class_weight('balanced', classes=np.unique(y), y=y)
@@ -338,24 +444,35 @@ class AWSOptimizedFootballPredictor:
         if optimize_hyperparameters:
             print("🔧 Optimizing hyperparameters (cloud-efficient)...")
             
-            # Cloud-optimized parameter grids
+            # Memory-constrained parameter grids (reduced search space)
+            n_cores = min(4, os.cpu_count() or 4)  # Limit cores to prevent overload
+            print(f"🔧 Using {n_cores} cores for training (memory-optimized)")
+            
             models_to_try = {
                 'RandomForest': {
-                    'model': RandomForestClassifier(random_state=42, class_weight=class_weight_dict, n_jobs=-1),
+                    'model': RandomForestClassifier(
+                        random_state=42, 
+                        class_weight=class_weight_dict, 
+                        n_jobs=n_cores,  # Limited cores
+                        warm_start=True  # Memory optimization
+                    ),
                     'params': {
-                        'n_estimators': [200, 300],
-                        'max_depth': [15, 20],
-                        'min_samples_split': [2, 5],
+                        'n_estimators': [150, 200],  # Reduced from [200, 300]
+                        'max_depth': [12, 15],       # Reduced from [15, 20]
+                        'min_samples_split': [5],    # Reduced options
                         'max_features': ['sqrt']
                     }
                 },
                 'GradientBoosting': {
-                    'model': GradientBoostingClassifier(random_state=42),
+                    'model': GradientBoostingClassifier(
+                        random_state=42,
+                        warm_start=True  # Memory optimization
+                    ),
                     'params': {
-                        'n_estimators': [200],
-                        'learning_rate': [0.1, 0.15],
-                        'max_depth': [4, 5],
-                        'min_samples_split': [2, 5]
+                        'n_estimators': [150],       # Reduced from [200]
+                        'learning_rate': [0.1],      # Reduced options
+                        'max_depth': [4],            # Single value
+                        'min_samples_split': [5]     # Single value
                     }
                 }
             }
@@ -372,8 +489,9 @@ class AWSOptimizedFootballPredictor:
                     model_config['params'],
                     cv=3, 
                     scoring='accuracy',
-                    n_jobs=-1,
-                    verbose=0
+                    n_jobs=1,      # Sequential processing to avoid memory overload
+                    verbose=0,
+                    pre_dispatch='1*n_jobs'  # Limit memory by dispatching jobs sequentially
                 )
                 
                 grid_search.fit(X_train_scaled, y_train)
@@ -390,15 +508,17 @@ class AWSOptimizedFootballPredictor:
             print(f"🏆 Best model: {best_model_name} (CV Score: {best_score:.4f})")
             
         else:
-            # Default high-quality model
+            # Default memory-optimized model
+            n_cores = min(4, os.cpu_count() or 4)
             self.model = RandomForestClassifier(
-                n_estimators=300,
-                max_depth=20,
-                min_samples_split=2,
+                n_estimators=200,         # Reduced from 300
+                max_depth=15,             # Reduced from 20
+                min_samples_split=5,      # Increased for regularization
                 max_features='sqrt',
                 random_state=42,
                 class_weight=class_weight_dict,
-                n_jobs=-1
+                n_jobs=n_cores,          # Limited cores
+                warm_start=True          # Memory optimization
             )
             self.model.fit(X_train_scaled, y_train)
         
@@ -421,7 +541,7 @@ class AWSOptimizedFootballPredictor:
             }).sort_values('importance', ascending=False)
             
             print(f"\n🔍 TOP 10 MOST IMPORTANT FEATURES:")
-            for idx, row in feature_importance.head(10).iterrows():
+            for _, row in feature_importance.head(10).iterrows():
                 print(f"  {row['feature']}: {row['importance']:.4f}")
         
         return X_test, y_test, y_pred
