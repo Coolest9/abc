@@ -398,10 +398,32 @@ class AWSOptimizedFootballPredictor:
         # Prepare data with robust handling and sampling
         model_data = df_form.dropna(subset=features + ['Result'])
         
-        # Limit training data size for memory efficiency
+        # Limit training data size for memory efficiency with balanced sampling
         if len(model_data) > max_samples:
-            print(f"📊 Sampling {max_samples} most recent matches for memory efficiency")
-            model_data = model_data.tail(max_samples).copy()
+            print(f"📊 Sampling {max_samples} matches with balanced classes for memory efficiency")
+            
+            # Get class distribution
+            class_counts = model_data['Result'].value_counts()
+            print(f"   Original distribution: {dict(class_counts)}")
+            
+            if len(class_counts) > 1:
+                # Stratified sampling to maintain class balance
+                samples_per_class = max_samples // len(class_counts)
+                balanced_samples = []
+                
+                for class_val in class_counts.index:
+                    class_data = model_data[model_data['Result'] == class_val]
+                    n_samples = min(samples_per_class, len(class_data))
+                    sampled = class_data.sample(n=n_samples, random_state=42) if n_samples > 0 else class_data
+                    balanced_samples.append(sampled)
+                
+                model_data = pd.concat(balanced_samples, ignore_index=True).sample(frac=1, random_state=42)
+                print(f"   Balanced distribution: {dict(model_data['Result'].value_counts())}")
+            else:
+                # Fallback to recent data if only one class
+                model_data = model_data.tail(max_samples).copy()
+                print("   ⚠️  Only one class found, using recent data")
+            
             gc.collect()
         
         X = model_data[features].fillna(0)  # Handle any remaining NaNs
@@ -531,7 +553,17 @@ class AWSOptimizedFootballPredictor:
         print(f"\n🎯 FINAL MODEL PERFORMANCE")
         print(f"🎯 Test Accuracy: {accuracy:.1%}")
         print("\n📊 Detailed Classification Report:")
-        print(classification_report(y_test, y_pred, target_names=['Away Win', 'Draw', 'Home Win']))
+        
+        # Handle case where not all classes are present in test set
+        unique_classes = sorted(list(set(y_test) | set(y_pred)))
+        if len(unique_classes) == 3:
+            target_names = ['Away Win', 'Draw', 'Home Win']
+            labels = [0, 1, 2]
+        else:
+            target_names = [['Away Win', 'Draw', 'Home Win'][i] for i in unique_classes]
+            labels = unique_classes
+            
+        print(classification_report(y_test, y_pred, target_names=target_names, labels=labels))
         
         # Feature importance
         if hasattr(self.model, 'feature_importances_'):
