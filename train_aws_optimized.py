@@ -147,7 +147,7 @@ class AWSOptimizedFootballPredictor:
         df_clean = all_data[available_columns].copy()
         
         # Clean up intermediate data
-        del all_data, df_list
+        del all_data_chunks
         gc.collect()
         self.log_memory_usage("After initial cleanup")
         
